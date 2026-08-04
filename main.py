@@ -42,7 +42,7 @@ PRIVATE_CHAT_FROM_POST_RE = re.compile(
 )
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -67,6 +67,24 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    """)
+
+    # 기존 DB 호환: 예전 rooms 테이블에 source 컬럼이 없으면 유지한 채 추가
+    cols = [row[1] for row in cur.execute("PRAGMA table_info(rooms)").fetchall()]
+    if "source" not in cols:
+        cur.execute("ALTER TABLE rooms ADD COLUMN source TEXT")
+
+    # 발송 로그 테이블: 기존 방/글 등록 데이터는 그대로 유지
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS send_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sent_at TEXT NOT NULL,
+            chat_id INTEGER,
+            room_title TEXT,
+            status TEXT NOT NULL,
+            error TEXT,
+            trigger_type TEXT NOT NULL
         )
     """)
 
@@ -128,6 +146,46 @@ def get_setting(key):
     ).fetchone()
     conn.close()
     return row["value"] if row else None
+
+def add_send_log(chat_id, room_title, status, error="", trigger_type="자동"):
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO send_logs(sent_at, chat_id, room_title, status, error, trigger_type)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now(TIMEZONE).isoformat(),
+            chat_id,
+            room_title,
+            status,
+            (error or "")[:1000],
+            trigger_type,
+        )
+    )
+    conn.commit()
+    conn.close()
+
+def get_send_logs(limit=20):
+    limit = max(1, min(int(limit), 100))
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT id, sent_at, chat_id, room_title, status, error, trigger_type
+        FROM send_logs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def clear_send_logs():
+    conn = db()
+    conn.execute("DELETE FROM send_logs")
+    conn.commit()
+    conn.close()
 
 async def resolve_room_from_link(url: str):
     url = url.strip()
@@ -205,17 +263,24 @@ async def copy_registered_post(target_chat_id):
     msg = await get_registered_message()
     await client.send_message(target_chat_id, msg)
 
-async def send_to_all_rooms():
+async def send_to_all_rooms(trigger_type="자동"):
     rooms = get_rooms()
 
     if not rooms:
         print("등록된 방이 없습니다.")
-        return
+        return 0, 0
+
+    success = 0
+    failed = 0
 
     for room in rooms:
         while True:
             try:
                 await copy_registered_post(room["chat_id"])
+                add_send_log(
+                    room["chat_id"], room["title"], "성공", trigger_type=trigger_type
+                )
+                success += 1
                 print(
                     f"[발송 성공] {room['title']} "
                     f"({room['chat_id']})"
@@ -232,12 +297,18 @@ async def send_to_all_rooms():
                 await asyncio.sleep(wait_seconds)
 
             except Exception as e:
+                error_text = f"{type(e).__name__}: {e}"
+                add_send_log(
+                    room["chat_id"], room["title"], "실패", error_text, trigger_type
+                )
+                failed += 1
                 print(
                     f"[발송 실패] {room['title']} "
-                    f"({room['chat_id']}): "
-                    f"{type(e).__name__}: {e}"
+                    f"({room['chat_id']}): {error_text}"
                 )
                 break
+
+    return success, failed
 
 def seconds_until_next_slot():
     now = datetime.now(TIMEZONE)
@@ -269,7 +340,7 @@ async def scheduler():
         )
 
         await asyncio.sleep(wait_seconds)
-        await send_to_all_rooms()
+        await send_to_all_rooms("자동")
 
 @client.on(
     events.NewMessage(
@@ -462,11 +533,59 @@ async def cmd_send_now(event):
         "📤 등록된 방으로 테스트 발송을 시작합니다."
     )
 
-    await send_to_all_rooms()
+    success, failed = await send_to_all_rooms("수동")
 
     await event.edit(
-        "✅ 테스트 발송 완료"
+        f"✅ 테스트 발송 완료\n성공 {success} / 실패 {failed}"
     )
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^/로그(?:\s+(\d+))?$"
+    )
+)
+async def cmd_logs(event):
+    raw_limit = event.pattern_match.group(1)
+    limit = int(raw_limit) if raw_limit else 20
+    limit = max(1, min(limit, 100))
+
+    rows = get_send_logs(limit)
+    if not rows:
+        await event.edit("📭 발송 로그가 없습니다.")
+        return
+
+    lines = [f"📜 최근 발송 로그 {len(rows)}건"]
+    for row in rows:
+        try:
+            dt = datetime.fromisoformat(row["sent_at"])
+            time_text = dt.astimezone(TIMEZONE).strftime("%m/%d %H:%M:%S")
+        except Exception:
+            time_text = str(row["sent_at"])[:19]
+
+        mark = "✅" if row["status"] == "성공" else "❌"
+        line = (
+            f"{mark} {time_text} [{row['trigger_type']}]\n"
+            f"{row['room_title'] or row['chat_id']}"
+        )
+        if row["status"] != "성공" and row["error"]:
+            line += f"\n↳ {row['error'][:180]}"
+        lines.append(line)
+
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n… 일부 생략됨"
+    await event.edit(text)
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^/로그삭제$"
+    )
+)
+async def cmd_clear_logs(event):
+    clear_send_logs()
+    await event.edit("🗑 발송 로그를 모두 삭제했습니다.")
 
 @client.on(
     events.NewMessage(
@@ -484,6 +603,9 @@ async def cmd_help(event):
         "/글확인\n"
         "/글삭제\n"
         "/발송\n"
+        "/로그 - 최근 20건\n"
+        "/로그 50 - 최근 50건 (최대 100)\n"
+        "/로그삭제\n"
         "/도움말\n\n"
         f"자동발송 간격: {INTERVAL_HOURS}시간\n"
         f"방별 발송 대기: {SEND_DELAY_SECONDS}초\n"
