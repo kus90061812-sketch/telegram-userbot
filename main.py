@@ -8,18 +8,23 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
+API_HASH = os.environ["API_HASH"].strip()
+
+SESSION_STRING = (
+    os.environ["SESSION_STRING"]
+    .strip()
+    .strip('"')
+    .strip("'")
+    .replace("\n", "")
+    .replace("\r", "")
+    .replace(" ", "")
+)
 
 INTERVAL_HOURS = int(os.environ.get("INTERVAL_HOURS", "1"))
 DB_PATH = os.environ.get("DB_PATH", "userbot.db")
 TIMEZONE = ZoneInfo("Asia/Seoul")
 
-client = TelegramClient(
-    StringSession(SESSION_STRING),
-    API_ID,
-    API_HASH,
-)
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -27,9 +32,12 @@ def db():
     return conn
 
 def init_db():
+    parent = os.path.dirname(DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     conn = db()
     cur = conn.cursor()
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS rooms (
             chat_id INTEGER PRIMARY KEY,
@@ -37,18 +45,16 @@ def init_db():
             added_at TEXT NOT NULL
         )
     """)
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
-
     conn.commit()
     conn.close()
 
-def add_room(chat_id: int, title: str):
+def add_room(chat_id, title):
     conn = db()
     conn.execute(
         "INSERT OR REPLACE INTO rooms(chat_id, title, added_at) VALUES (?, ?, ?)",
@@ -57,7 +63,7 @@ def add_room(chat_id: int, title: str):
     conn.commit()
     conn.close()
 
-def remove_room(chat_id: int):
+def remove_room(chat_id):
     conn = db()
     conn.execute("DELETE FROM rooms WHERE chat_id = ?", (chat_id,))
     conn.commit()
@@ -65,11 +71,13 @@ def remove_room(chat_id: int):
 
 def get_rooms():
     conn = db()
-    rows = conn.execute("SELECT chat_id, title FROM rooms ORDER BY added_at ASC").fetchall()
+    rows = conn.execute(
+        "SELECT chat_id, title FROM rooms ORDER BY added_at ASC"
+    ).fetchall()
     conn.close()
     return rows
 
-def set_setting(key: str, value: str):
+def set_setting(key, value):
     conn = db()
     conn.execute(
         "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
@@ -78,9 +86,12 @@ def set_setting(key: str, value: str):
     conn.commit()
     conn.close()
 
-def get_setting(key: str):
+def get_setting(key):
     conn = db()
-    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        (key,)
+    ).fetchone()
     conn.close()
     return row["value"] if row else None
 
@@ -92,27 +103,21 @@ async def get_chat_title(event):
         or str(event.chat_id)
     )
 
-async def copy_registered_post(target_chat_id: int):
+async def copy_registered_post(target_chat_id):
     source_chat_id = get_setting("source_chat_id")
     source_message_id = get_setting("source_message_id")
 
     if not source_chat_id or not source_message_id:
         raise RuntimeError("등록된 글이 없습니다.")
 
-    msg = await client.get_messages(
-        int(source_chat_id),
-        ids=int(source_message_id)
-    )
-
+    msg = await client.get_messages(int(source_chat_id), ids=int(source_message_id))
     if not msg:
         raise RuntimeError("등록된 원본 글을 찾지 못했습니다.")
 
-    # Message 객체를 넘기면 원본을 '복사'하는 형태로 재전송 가능
     await client.send_message(target_chat_id, msg)
 
 async def send_to_all_rooms():
     rooms = get_rooms()
-
     if not rooms:
         print("등록된 방이 없습니다.")
         return
@@ -225,7 +230,6 @@ async def cmd_help(event):
 
 async def main():
     init_db()
-
     await client.start()
     me = await client.get_me()
 

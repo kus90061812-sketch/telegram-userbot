@@ -12,7 +12,9 @@ with TelegramClient(StringSession(), api_id, api_hash) as client:
     client.start()
     session_string = client.session.save()
 
-print("\n===== SESSION_STRING =====")
-print(session_string)
-print("==========================")
-print("\n이 긴 문자열 전체를 Railway Variables의 SESSION_STRING에 넣으세요.")
+with open("SESSION_ONLY.txt", "w", encoding="utf-8") as f:
+    f.write(session_string)
+
+print("\nSESSION_ONLY.txt 파일을 만들었습니다.")
+print("파일 안의 한 줄 전체를 Railway SESSION_STRING에 넣으세요.")
+print("복사 후 SESSION_ONLY.txt는 반드시 삭제하세요.")
