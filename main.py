@@ -174,7 +174,19 @@ def clear_send_logs():
 
 async def resolve_room_from_link(url: str):
     url = url.strip()
+    # 숫자 Telegram chat_id 직접 등록
+    if re.fullmatch(r"-100\d+", url):
+        chat_id = int(url)
+        entity = await client.get_entity(chat_id)
 
+        title = (
+            getattr(entity, "title", None)
+            or getattr(entity, "first_name", None)
+            or str(chat_id)
+        )
+
+        return chat_id, title
+        
     m = PRIVATE_CHAT_RE.match(url)
     if m:
         internal_id = int(m.group(1))
