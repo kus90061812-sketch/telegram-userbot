@@ -177,17 +177,14 @@ def clear_send_logs():
 async def resolve_room_from_link(url: str):
     url = url.strip()
 
-    # 숫자 Telegram chat_id 직접 등록
     if re.fullmatch(r"-100\d+", url):
         chat_id = int(url)
         entity = await client.get_entity(chat_id)
-
         title = (
             getattr(entity, "title", None)
             or getattr(entity, "first_name", None)
             or str(chat_id)
         )
-
         return chat_id, title
 
     m = PRIVATE_CHAT_RE.match(url)
@@ -195,13 +192,11 @@ async def resolve_room_from_link(url: str):
         internal_id = int(m.group(1))
         chat_id = int(f"-100{internal_id}")
         entity = await client.get_entity(chat_id)
-
         title = (
             getattr(entity, "title", None)
             or getattr(entity, "first_name", None)
             or str(chat_id)
         )
-
         return chat_id, title
 
     m = PUBLIC_CHAT_RE.match(url)
@@ -209,13 +204,11 @@ async def resolve_room_from_link(url: str):
         username = m.group(1)
         entity = await client.get_entity(username)
         chat_id = utils.get_peer_id(entity)
-
         title = (
             getattr(entity, "title", None)
             or getattr(entity, "first_name", None)
             or username
         )
-
         return chat_id, title
 
     raise ValueError(
@@ -284,14 +277,12 @@ async def retry_room_after_wait(room, wait_seconds, trigger_type):
 
             try:
                 await copy_registered_post(chat_id)
-
                 add_send_log(
                     chat_id,
                     title,
                     "성공",
                     trigger_type=f"{trigger_type}-재시도"
                 )
-
                 print(f"[재시도 성공] {title} ({chat_id})")
                 break
 
@@ -304,7 +295,6 @@ async def retry_room_after_wait(room, wait_seconds, trigger_type):
 
             except Exception as e:
                 error_text = f"{type(e).__name__}: {e}"
-
                 add_send_log(
                     chat_id,
                     title,
@@ -312,7 +302,6 @@ async def retry_room_after_wait(room, wait_seconds, trigger_type):
                     error_text,
                     f"{trigger_type}-재시도"
                 )
-
                 print(
                     f"[재시도 실패] {title} "
                     f"({chat_id}): {error_text}"
@@ -325,7 +314,6 @@ async def retry_room_after_wait(room, wait_seconds, trigger_type):
 
 def schedule_room_retry(room, wait_seconds, trigger_type):
     chat_id = room["chat_id"]
-
     old_task = RETRY_TASKS.get(chat_id)
 
     if old_task and not old_task.done():
@@ -333,11 +321,7 @@ def schedule_room_retry(room, wait_seconds, trigger_type):
         return False
 
     RETRY_TASKS[chat_id] = asyncio.create_task(
-        retry_room_after_wait(
-            room,
-            wait_seconds,
-            trigger_type
-        )
+        retry_room_after_wait(room, wait_seconds, trigger_type)
     )
     return True
 
@@ -355,8 +339,6 @@ async def send_to_all_rooms(trigger_type="자동"):
 
     for room in rooms:
         chat_id = room["chat_id"]
-
-        # 이미 재시도 대기 중인 방은 건너뛰고 나머지 방 계속 진행
         task = RETRY_TASKS.get(chat_id)
 
         if task and not task.done():
@@ -369,21 +351,14 @@ async def send_to_all_rooms(trigger_type="자동"):
 
         try:
             await copy_registered_post(chat_id)
-
             add_send_log(
                 chat_id,
                 room["title"],
                 "성공",
                 trigger_type=trigger_type
             )
-
             success += 1
-
-            print(
-                f"[발송 성공] "
-                f"{room['title']} ({chat_id})"
-            )
-
+            print(f"[발송 성공] {room['title']} ({chat_id})")
             await asyncio.sleep(SEND_DELAY_SECONDS)
 
         except FloodWaitError as e:
@@ -397,13 +372,10 @@ async def send_to_all_rooms(trigger_type="자동"):
                 f"{room['title']} - "
                 f"{wait_seconds}초 후 별도 재시도"
             )
-
-            # 전체 루프는 멈추지 않고 다음 방으로 진행
             continue
 
         except Exception as e:
             error_text = f"{type(e).__name__}: {e}"
-
             add_send_log(
                 chat_id,
                 room["title"],
@@ -411,9 +383,7 @@ async def send_to_all_rooms(trigger_type="자동"):
                 error_text,
                 trigger_type
             )
-
             failed += 1
-
             print(
                 f"[발송 실패] "
                 f"{room['title']} ({chat_id}): "
@@ -425,13 +395,8 @@ async def send_to_all_rooms(trigger_type="자동"):
 
 def seconds_until_next_slot():
     now = datetime.now(TIMEZONE)
-
     next_run = (
-        now.replace(
-            minute=0,
-            second=0,
-            microsecond=0
-        )
+        now.replace(minute=0, second=0, microsecond=0)
         + timedelta(hours=1)
     )
 
@@ -439,25 +404,19 @@ def seconds_until_next_slot():
         while next_run.hour % INTERVAL_HOURS != 0:
             next_run += timedelta(hours=1)
 
-    return max(
-        1,
-        (next_run - now).total_seconds()
-    ), next_run
+    return max(1, (next_run - now).total_seconds()), next_run
 
 
 async def scheduler():
     while True:
         wait_seconds, next_run = seconds_until_next_slot()
-
         print(
             "다음 자동발송:",
             next_run.strftime("%Y-%m-%d %H:%M:%S KST")
         )
-
         await asyncio.sleep(wait_seconds)
 
         success, failed, retry = await send_to_all_rooms("자동")
-
         print(
             f"[자동발송 완료] "
             f"성공={success} 실패={failed} 재시도대기={retry}"
@@ -472,14 +431,9 @@ async def respond(event, text):
 
 
 async def handle_command(event):
-    global MY_ID
-
     text = (event.raw_text or "").strip()
 
     if not text.startswith("/"):
-        return
-
-    if event.sender_id != MY_ID and not event.out:
         return
 
     print(f"[명령감지] {text}")
@@ -511,10 +465,7 @@ async def handle_command(event):
         ]
 
         if not active_ids:
-            await respond(
-                event,
-                "⏳ 재시도 대기 중인 방이 없습니다."
-            )
+            await respond(event, "⏳ 재시도 대기 중인 방이 없습니다.")
         else:
             await respond(
                 event,
@@ -534,14 +485,9 @@ async def handle_command(event):
 
         for i, room in enumerate(rooms, 1):
             source = room["source"] or str(room["chat_id"])
-            lines.append(
-                f"{i}. {room['title']}\n{source}"
-            )
+            lines.append(f"{i}. {room['title']}\n{source}")
 
-        await respond(
-            event,
-            "\n\n".join(lines)[:4000]
-        )
+        await respond(event, "\n\n".join(lines)[:4000])
         return
 
     if text.startswith("/방등록 "):
@@ -549,28 +495,18 @@ async def handle_command(event):
 
         try:
             chat_id, title = await resolve_room_from_link(url)
-
-            add_room(
-                chat_id,
-                title,
-                url
-            )
-
+            add_room(chat_id, title, url)
             await respond(
                 event,
                 f"✅ 방 등록 완료\n"
-                f"{title}\n"
-                f"{url}\n"
-                f"ID: {chat_id}"
+                f"{title}\n{url}\nID: {chat_id}"
             )
-
         except Exception as e:
             await respond(
                 event,
                 f"❌ 방 등록 실패\n"
                 f"{type(e).__name__}: {e}"
             )
-
         return
 
     if text.startswith("/방삭제 "):
@@ -578,25 +514,19 @@ async def handle_command(event):
 
         try:
             chat_id, title = await resolve_room_from_link(url)
-
             remove_room(chat_id)
 
             task = RETRY_TASKS.pop(chat_id, None)
             if task and not task.done():
                 task.cancel()
 
-            await respond(
-                event,
-                f"🗑 방 삭제 완료\n{title}"
-            )
-
+            await respond(event, f"🗑 방 삭제 완료\n{title}")
         except Exception as e:
             await respond(
                 event,
                 f"❌ 방 삭제 실패\n"
                 f"{type(e).__name__}: {e}"
             )
-
         return
 
     if text.startswith("/글등록 "):
@@ -613,40 +543,23 @@ async def handle_command(event):
             )
 
             if not msg:
-                raise RuntimeError(
-                    "게시글을 찾지 못했습니다."
-                )
+                raise RuntimeError("게시글을 찾지 못했습니다.")
 
-            set_setting(
-                "source_chat_id",
-                str(source_chat_id)
-            )
-            set_setting(
-                "source_message_id",
-                str(source_message_id)
-            )
-            set_setting(
-                "source_post_url",
-                url
-            )
+            set_setting("source_chat_id", str(source_chat_id))
+            set_setting("source_message_id", str(source_message_id))
+            set_setting("source_post_url", url)
 
-            await respond(
-                event,
-                f"✅ 발송글 등록 완료\n{url}"
-            )
-
+            await respond(event, f"✅ 발송글 등록 완료\n{url}")
         except Exception as e:
             await respond(
                 event,
                 f"❌ 글 등록 실패\n"
                 f"{type(e).__name__}: {e}"
             )
-
         return
 
     if text == "/글확인":
         url = get_setting("source_post_url")
-
         await respond(
             event,
             f"📝 등록된 발송글\n{url}"
@@ -659,39 +572,25 @@ async def handle_command(event):
         set_setting("source_chat_id", "")
         set_setting("source_message_id", "")
         set_setting("source_post_url", "")
-
-        await respond(
-            event,
-            "🗑 등록된 발송글을 삭제했습니다."
-        )
+        await respond(event, "🗑 등록된 발송글을 삭제했습니다.")
         return
 
     if text == "/발송":
-        await respond(
-            event,
-            "📤 테스트 발송 시작"
-        )
+        await respond(event, "📤 테스트 발송 시작")
 
-        success, failed, retry = (
-            await send_to_all_rooms("수동")
-        )
+        success, failed, retry = await send_to_all_rooms("수동")
 
         await respond(
             event,
             "✅ 테스트 발송 완료\n"
-            f"성공 {success} / "
-            f"실패 {failed} / "
+            f"성공 {success} / 실패 {failed} / "
             f"재시도대기 {retry}"
         )
         return
 
     if text == "/로그삭제":
         clear_send_logs()
-
-        await respond(
-            event,
-            "🗑 발송 로그를 모두 삭제했습니다."
-        )
+        await respond(event, "🗑 발송 로그를 모두 삭제했습니다.")
         return
 
     if text == "/로그" or text.startswith("/로그 "):
@@ -699,37 +598,22 @@ async def handle_command(event):
         limit = 20
 
         if len(parts) >= 2 and parts[1].isdigit():
-            limit = max(
-                1,
-                min(int(parts[1]), 100)
-            )
+            limit = max(1, min(int(parts[1]), 100))
 
         rows = get_send_logs(limit)
 
         if not rows:
-            await respond(
-                event,
-                "📭 발송 로그가 없습니다."
-            )
+            await respond(event, "📭 발송 로그가 없습니다.")
             return
 
-        lines = [
-            f"📜 최근 발송 로그 {len(rows)}건"
-        ]
+        lines = [f"📜 최근 발송 로그 {len(rows)}건"]
 
         for row in rows:
-            mark = (
-                "✅"
-                if row["status"] == "성공"
-                else "❌"
-            )
-
+            mark = "✅" if row["status"] == "성공" else "❌"
             sent_at = row["sent_at"]
 
             if sent_at.tzinfo is None:
-                sent_at = sent_at.replace(
-                    tzinfo=TIMEZONE
-                )
+                sent_at = sent_at.replace(tzinfo=TIMEZONE)
 
             ts = (
                 sent_at
@@ -738,31 +622,22 @@ async def handle_command(event):
             )
 
             item = (
-                f"{mark} {ts} "
-                f"[{row['trigger_type']}]\n"
+                f"{mark} {ts} [{row['trigger_type']}]\n"
                 f"{row['room_title'] or row['chat_id']}"
             )
 
-            if (
-                row["status"] != "성공"
-                and row["error"]
-            ):
-                item += (
-                    f"\n↳ "
-                    f"{row['error'][:180]}"
-                )
+            if row["status"] != "성공" and row["error"]:
+                item += f"\n↳ {row['error'][:180]}"
 
             lines.append(item)
 
-        await respond(
-            event,
-            "\n\n".join(lines)[:4000]
-        )
+        await respond(event, "\n\n".join(lines)[:4000])
         return
 
 
-@client.on(events.NewMessage())
-async def catch_all_messages(event):
+# 핵심 수정: 내 계정이 보낸 메시지만 확실하게 수신
+@client.on(events.NewMessage(outgoing=True))
+async def catch_outgoing_commands(event):
     try:
         await handle_command(event)
     except Exception as e:
@@ -783,19 +658,10 @@ async def main():
     me = await client.get_me()
     MY_ID = me.id
 
-    print(
-        f"로그인 완료: "
-        f"{me.first_name} / id={MY_ID}"
-    )
-    print(
-        f"자동발송 간격="
-        f"{INTERVAL_HOURS}시간"
-    )
-    print(
-        f"방별 발송 대기="
-        f"{SEND_DELAY_SECONDS}초"
-    )
-    print("명령어 감지기 활성화")
+    print(f"로그인 완료: {me.first_name} / id={MY_ID}")
+    print(f"자동발송 간격={INTERVAL_HOURS}시간")
+    print(f"방별 발송 대기={SEND_DELAY_SECONDS}초")
+    print("명령어 감지기 활성화(outgoing=True)")
     print("FloodWait 별도 재시도 모드 활성화")
 
     asyncio.create_task(scheduler())
