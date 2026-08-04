@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -29,13 +28,13 @@ SESSION_STRING = (
 )
 
 DATABASE_URL = os.environ["DATABASE_URL"].strip()
-
-# 자동발송 주기(시간)
 INTERVAL_HOURS = int(os.environ.get("INTERVAL_HOURS", "1"))
 
-# 방 하나 발송 후 다음 방까지 쉬는 시간(초)
-# Railway Variables에서 SEND_DELAY_SECONDS로 조절 가능
-SEND_DELAY_SECONDS = float(os.environ.get("SEND_DELAY_SECONDS", "5.0"))
+# Railway Variables에서 조절
+SEND_DELAY_SECONDS = float(os.environ.get("SEND_DELAY_SECONDS", "30.0"))
+
+# 재시도 확인 주기
+RETRY_CHECK_SECONDS = int(os.environ.get("RETRY_CHECK_SECONDS", "30"))
 
 TIMEZONE = ZoneInfo("Asia/Seoul")
 
@@ -45,22 +44,19 @@ client = TelegramClient(
     API_HASH,
 )
 
-# 공개 게시글: https://t.me/channelname/123
+
+# =========================
+# 링크 패턴
+# =========================
 PUBLIC_POST_RE = re.compile(
     r"^(?:https?://)?t\.me/([A-Za-z0-9_]+)/(\d+)(?:\?.*)?$"
 )
-
-# 비공개 게시글: https://t.me/c/123456789/123
 PRIVATE_POST_RE = re.compile(
     r"^(?:https?://)?t\.me/c/(\d+)/(\d+)(?:\?.*)?$"
 )
-
-# 공개 방: https://t.me/groupname
 PUBLIC_CHAT_RE = re.compile(
     r"^(?:https?://)?t\.me/([A-Za-z0-9_]+)(?:/)?(?:\?.*)?$"
 )
-
-# 비공개 방 메시지 링크: https://t.me/c/123456789/10
 PRIVATE_CHAT_RE = re.compile(
     r"^(?:https?://)?t\.me/c/(\d+)(?:/(\d+))?(?:\?.*)?$"
 )
@@ -71,14 +67,11 @@ PRIVATE_CHAT_RE = re.compile(
 # =========================
 MY_ID = None
 
-# 슬로우모드 방별 재시도 작업
-RETRY_TASKS = {}
-
-# 계정 전체 FloodWait 만료 시각(monotonic)
-GLOBAL_FLOOD_UNTIL = 0.0
-
-# 자동/수동 전체발송 동시 실행 방지
+# 자동발송과 수동 /발송 동시 실행 방지
 SEND_BATCH_LOCK = asyncio.Lock()
+
+# 재시도 worker가 같은 방을 동시에 집지 않게 방지
+RETRY_IN_PROGRESS = set()
 
 
 # =========================
@@ -127,6 +120,23 @@ def init_db():
                 ON send_logs(id DESC)
             """)
 
+            # 방별 FloodWait / SlowMode 재시도 상태
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS room_retries (
+                    chat_id BIGINT PRIMARY KEY,
+                    room_title TEXT,
+                    retry_at TIMESTAMPTZ NOT NULL,
+                    reason TEXT,
+                    trigger_type TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_room_retries_retry_at
+                ON room_retries(retry_at ASC)
+            """)
+
 
 def add_room(chat_id, title, source):
     with db() as conn:
@@ -153,6 +163,10 @@ def remove_room(chat_id):
                 "DELETE FROM rooms WHERE chat_id = %s",
                 (chat_id,)
             )
+            cur.execute(
+                "DELETE FROM room_retries WHERE chat_id = %s",
+                (chat_id,)
+            )
 
 
 def get_rooms():
@@ -164,6 +178,17 @@ def get_rooms():
                 ORDER BY added_at ASC
             """)
             return cur.fetchall()
+
+
+def get_room(chat_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT chat_id, title, source
+                FROM rooms
+                WHERE chat_id = %s
+            """, (chat_id,))
+            return cur.fetchone()
 
 
 def set_setting(key, value):
@@ -243,14 +268,126 @@ def clear_send_logs():
             cur.execute("DELETE FROM send_logs")
 
 
+def set_room_retry(
+    chat_id,
+    room_title,
+    wait_seconds,
+    reason,
+    trigger_type
+):
+    wait_seconds = max(1, int(wait_seconds) + 2)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO room_retries(
+                    chat_id,
+                    room_title,
+                    retry_at,
+                    reason,
+                    trigger_type,
+                    updated_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    NOW() + (%s * INTERVAL '1 second'),
+                    %s,
+                    %s,
+                    NOW()
+                )
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    room_title = EXCLUDED.room_title,
+                    retry_at = EXCLUDED.retry_at,
+                    reason = EXCLUDED.reason,
+                    trigger_type = EXCLUDED.trigger_type,
+                    updated_at = NOW()
+            """, (
+                chat_id,
+                room_title,
+                wait_seconds,
+                reason,
+                trigger_type,
+            ))
+
+    return wait_seconds
+
+
+def clear_room_retry(chat_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM room_retries WHERE chat_id = %s",
+                (chat_id,)
+            )
+
+
+def get_room_retry(chat_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    chat_id,
+                    room_title,
+                    retry_at,
+                    reason,
+                    trigger_type
+                FROM room_retries
+                WHERE chat_id = %s
+            """, (chat_id,))
+            return cur.fetchone()
+
+
+def get_due_retries(limit=20):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    chat_id,
+                    room_title,
+                    retry_at,
+                    reason,
+                    trigger_type
+                FROM room_retries
+                WHERE retry_at <= NOW()
+                ORDER BY retry_at ASC
+                LIMIT %s
+            """, (limit,))
+            return cur.fetchall()
+
+
+def get_retry_count():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM room_retries"
+            )
+            row = cur.fetchone()
+            return int(row["cnt"])
+
+
+def get_retry_list(limit=30):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    chat_id,
+                    room_title,
+                    retry_at,
+                    reason
+                FROM room_retries
+                ORDER BY retry_at ASC
+                LIMIT %s
+            """, (limit,))
+            return cur.fetchall()
+
+
 # =========================
 # 링크 / 방 해석
 # =========================
 async def resolve_room_from_link(value: str):
     value = value.strip()
 
-    # 숫자 채팅 ID 직접 등록
-    # 예: /방등록 -1001935285339
     if re.fullmatch(r"-100\d+", value):
         chat_id = int(value)
         entity = await client.get_entity(chat_id)
@@ -262,7 +399,6 @@ async def resolve_room_from_link(value: str):
         )
         return chat_id, title
 
-    # 비공개 방 메시지 링크
     m = PRIVATE_CHAT_RE.match(value)
     if m:
         internal_id = int(m.group(1))
@@ -277,7 +413,6 @@ async def resolve_room_from_link(value: str):
         )
         return chat_id, title
 
-    # 공개 방 링크
     m = PUBLIC_CHAT_RE.match(value)
     if m:
         username = m.group(1)
@@ -348,10 +483,6 @@ async def get_registered_message():
 
 
 async def forward_registered_post(target_chat_id):
-    """
-    원본 채널 게시글을 '새 메시지 복사'가 아니라
-    Telegram 전달하기(Forward) 방식으로 보낸다.
-    """
     msg = await get_registered_message()
 
     await client.forward_messages(
@@ -361,264 +492,110 @@ async def forward_registered_post(target_chat_id):
 
 
 # =========================
-# FloodWait / SlowMode
+# 방별 발송
 # =========================
-def set_global_flood_wait(seconds):
-    global GLOBAL_FLOOD_UNTIL
-
-    wait_seconds = max(1, int(seconds) + 2)
-
-    GLOBAL_FLOOD_UNTIL = max(
-        GLOBAL_FLOOD_UNTIL,
-        time.monotonic() + wait_seconds
-    )
-
-    return wait_seconds
-
-
-def get_global_flood_remaining():
-    return max(
-        0,
-        int(GLOBAL_FLOOD_UNTIL - time.monotonic())
-    )
-
-
-async def wait_for_global_flood():
-    """
-    계정 전체 FloodWait가 있으면 기다린다.
-    60초 단위로 깨어나 로그를 남겨서 살아있는지 확인 가능.
-    """
-    while True:
-        remaining = get_global_flood_remaining()
-
-        if remaining <= 0:
-            return
-
-        print(
-            f"[계정 FloodWait 대기] "
-            f"{remaining}초 남음"
-        )
-
-        await asyncio.sleep(
-            min(remaining + 1, 60)
-        )
-
-
-async def retry_room_after_slowmode(
-    room,
-    wait_seconds,
-    trigger_type
-):
-    """
-    방 자체 SlowMode만 별도 재시도.
-    계정 전체 FloodWait는 전역 대기 처리.
-    """
+async def send_one_room(room, trigger_type):
     chat_id = room["chat_id"]
     title = room["title"]
 
-    remaining = max(
-        1,
-        int(wait_seconds) + 2
-    )
+    # 이미 대기중이면 이 방만 건너뜀
+    retry_state = get_room_retry(chat_id)
 
-    try:
-        while True:
+    if retry_state:
+        retry_at = retry_state["retry_at"]
+
+        if retry_at > datetime.now(TIMEZONE):
             print(
-                f"[슬로우모드 재시도 대기] "
-                f"{title} - {remaining}초"
+                f"[대기중 건너뜀] "
+                f"{title} ({chat_id}) - "
+                f"{retry_at.astimezone(TIMEZONE).strftime('%m/%d %H:%M:%S')}"
             )
-
-            await asyncio.sleep(remaining)
-            await wait_for_global_flood()
-
-            try:
-                await forward_registered_post(chat_id)
-
-                add_send_log(
-                    chat_id,
-                    title,
-                    "성공",
-                    trigger_type=f"{trigger_type}-슬로우재시도"
-                )
-
-                print(
-                    f"[슬로우모드 재시도 성공] "
-                    f"{title} ({chat_id})"
-                )
-                return
-
-            except SlowModeWaitError as e:
-                remaining = max(
-                    1,
-                    int(e.seconds) + 2
-                )
-
-                print(
-                    f"[슬로우모드 재연장] "
-                    f"{title} - {remaining}초"
-                )
-
-            except FloodWaitError as e:
-                wait = set_global_flood_wait(e.seconds)
-
-                print(
-                    f"[계정 FloodWait] "
-                    f"{wait}초 대기 후 "
-                    f"{title} 재시도"
-                )
-
-                await wait_for_global_flood()
-                remaining = 1
-
-            except Exception as e:
-                error_text = (
-                    f"{type(e).__name__}: {e}"
-                )
-
-                add_send_log(
-                    chat_id,
-                    title,
-                    "실패",
-                    error_text,
-                    f"{trigger_type}-슬로우재시도"
-                )
-
-                print(
-                    f"[슬로우모드 재시도 실패] "
-                    f"{title} ({chat_id}): "
-                    f"{error_text}"
-                )
-                return
-
-    finally:
-        RETRY_TASKS.pop(
-            chat_id,
-            None
-        )
-
-
-def schedule_slowmode_retry(
-    room,
-    wait_seconds,
-    trigger_type
-):
-    chat_id = room["chat_id"]
-
-    old_task = RETRY_TASKS.get(chat_id)
-
-    if old_task and not old_task.done():
-        print(
-            f"[슬로우모드 재시도 중복 방지] "
-            f"{room['title']}"
-        )
-        return False
-
-    RETRY_TASKS[chat_id] = asyncio.create_task(
-        retry_room_after_slowmode(
-            room,
-            wait_seconds,
-            trigger_type
-        )
-    )
-
-    return True
-
-
-async def send_one_room(
-    room,
-    trigger_type
-):
-    """
-    한 방 발송.
-    - SlowMode: 그 방만 별도 재시도
-    - FloodWait: 계정 전체 제한이므로 기다렸다가 현재 방부터 재개
-    """
-    chat_id = room["chat_id"]
-    title = room["title"]
-
-    while True:
-        await wait_for_global_flood()
-
-        try:
-            await forward_registered_post(chat_id)
-
-            add_send_log(
-                chat_id,
-                title,
-                "성공",
-                trigger_type=trigger_type
-            )
-
-            print(
-                f"[발송 성공] "
-                f"{title} ({chat_id})"
-            )
-
-            return "success"
-
-        # SlowModeWaitError는 FloodWaitError 계열일 수 있으므로
-        # 반드시 FloodWaitError보다 먼저 처리
-        except SlowModeWaitError as e:
-            wait_seconds = max(
-                1,
-                int(e.seconds) + 2
-            )
-
-            schedule_slowmode_retry(
-                room,
-                wait_seconds,
-                trigger_type
-            )
-
-            print(
-                f"[슬로우모드 재시도 예약] "
-                f"{title} - "
-                f"{wait_seconds}초 후"
-            )
-
             return "retry"
 
-        except FloodWaitError as e:
-            wait_seconds = set_global_flood_wait(
-                e.seconds
-            )
+        # 시간이 이미 지났다면 재시도 worker가 처리할 수 있게 둔다.
+        # 전체 발송에서는 중복 시도를 피하기 위해 건너뜀.
+        print(
+            f"[재시도 예정 건너뜀] "
+            f"{title} ({chat_id})"
+        )
+        return "retry"
 
-            print(
-                f"[계정 FloodWait] "
-                f"{wait_seconds}초 대기 후 "
-                f"현재 방부터 이어서 진행"
-            )
+    try:
+        await forward_registered_post(chat_id)
 
-            # 모든 방을 재시도로 넣지 않는다.
-            # 계정 전체 제한이 풀릴 때까지 기다린 뒤
-            # 현재 방을 다시 시도한다.
-            await wait_for_global_flood()
+        clear_room_retry(chat_id)
 
-        except Exception as e:
-            error_text = (
-                f"{type(e).__name__}: {e}"
-            )
+        add_send_log(
+            chat_id,
+            title,
+            "성공",
+            trigger_type=trigger_type
+        )
 
-            add_send_log(
-                chat_id,
-                title,
-                "실패",
-                error_text,
-                trigger_type
-            )
+        print(
+            f"[발송 성공] "
+            f"{title} ({chat_id})"
+        )
 
-            print(
-                f"[발송 실패] "
-                f"{title} ({chat_id}): "
-                f"{error_text}"
-            )
+        return "success"
 
-            return "failed"
+    except SlowModeWaitError as e:
+        wait_seconds = set_room_retry(
+            chat_id,
+            title,
+            e.seconds,
+            "SlowMode",
+            trigger_type
+        )
+
+        print(
+            f"[SlowMode 격리] "
+            f"{title} - {wait_seconds}초 후 재시도"
+        )
+
+        return "retry"
+
+    except FloodWaitError as e:
+        # 핵심: FloodWait가 난 방만 격리하고
+        # 전체 발송은 다음 방으로 계속 진행
+        wait_seconds = set_room_retry(
+            chat_id,
+            title,
+            e.seconds,
+            "FloodWait",
+            trigger_type
+        )
+
+        print(
+            f"[FloodWait 방 격리] "
+            f"{title} - {wait_seconds}초 후 재시도"
+        )
+
+        return "retry"
+
+    except Exception as e:
+        error_text = (
+            f"{type(e).__name__}: {e}"
+        )
+
+        add_send_log(
+            chat_id,
+            title,
+            "실패",
+            error_text,
+            trigger_type
+        )
+
+        print(
+            f"[발송 실패] "
+            f"{title} ({chat_id}): "
+            f"{error_text}"
+        )
+
+        return "failed"
 
 
-async def send_to_all_rooms(
-    trigger_type="자동"
-):
+async def send_to_all_rooms(trigger_type="자동"):
     rooms = get_rooms()
 
     if not rooms:
@@ -629,23 +606,8 @@ async def send_to_all_rooms(
     failed = 0
     retry = 0
 
-    # 자동발송과 /발송 동시 실행 금지
     async with SEND_BATCH_LOCK:
         for room in rooms:
-            chat_id = room["chat_id"]
-
-            # 이 방은 이미 SlowMode 재시도 대기 중
-            task = RETRY_TASKS.get(chat_id)
-
-            if task and not task.done():
-                print(
-                    f"[슬로우모드 대기중 건너뜀] "
-                    f"{room['title']} ({chat_id})"
-                )
-
-                retry += 1
-                continue
-
             result = await send_one_room(
                 room,
                 trigger_type
@@ -653,23 +615,136 @@ async def send_to_all_rooms(
 
             if result == "success":
                 success += 1
-
-                # 성공한 방 다음에만 발송 간격 적용
                 await asyncio.sleep(
                     SEND_DELAY_SECONDS
                 )
-
             elif result == "retry":
                 retry += 1
-
+                # 격리된 방은 바로 다음 방으로 진행
+                await asyncio.sleep(1)
             else:
                 failed += 1
+                await asyncio.sleep(1)
 
     return success, failed, retry
 
 
 # =========================
-# 스케줄러
+# 재시도 worker
+# =========================
+async def retry_one_room(retry_row):
+    chat_id = retry_row["chat_id"]
+
+    if chat_id in RETRY_IN_PROGRESS:
+        return
+
+    RETRY_IN_PROGRESS.add(chat_id)
+
+    try:
+        room = get_room(chat_id)
+
+        # 방이 삭제된 경우 재시도도 정리
+        if not room:
+            clear_room_retry(chat_id)
+            return
+
+        title = room["title"]
+        trigger_type = retry_row["trigger_type"]
+
+        try:
+            await forward_registered_post(chat_id)
+
+            clear_room_retry(chat_id)
+
+            add_send_log(
+                chat_id,
+                title,
+                "성공",
+                trigger_type=f"{trigger_type}-재시도"
+            )
+
+            print(
+                f"[재시도 성공] "
+                f"{title} ({chat_id})"
+            )
+
+        except SlowModeWaitError as e:
+            wait_seconds = set_room_retry(
+                chat_id,
+                title,
+                e.seconds,
+                "SlowMode",
+                trigger_type
+            )
+
+            print(
+                f"[재시도 SlowMode] "
+                f"{title} - {wait_seconds}초 후 다시"
+            )
+
+        except FloodWaitError as e:
+            wait_seconds = set_room_retry(
+                chat_id,
+                title,
+                e.seconds,
+                "FloodWait",
+                trigger_type
+            )
+
+            print(
+                f"[재시도 FloodWait] "
+                f"{title} - {wait_seconds}초 후 다시"
+            )
+
+        except Exception as e:
+            error_text = (
+                f"{type(e).__name__}: {e}"
+            )
+
+            clear_room_retry(chat_id)
+
+            add_send_log(
+                chat_id,
+                title,
+                "실패",
+                error_text,
+                f"{trigger_type}-재시도"
+            )
+
+            print(
+                f"[재시도 실패] "
+                f"{title} ({chat_id}): "
+                f"{error_text}"
+            )
+
+    finally:
+        RETRY_IN_PROGRESS.discard(chat_id)
+
+
+async def retry_worker():
+    while True:
+        try:
+            due_rows = get_due_retries(limit=10)
+
+            for retry_row in due_rows:
+                await retry_one_room(retry_row)
+                await asyncio.sleep(
+                    SEND_DELAY_SECONDS
+                )
+
+        except Exception as e:
+            print(
+                f"[재시도 worker 오류] "
+                f"{type(e).__name__}: {e}"
+            )
+
+        await asyncio.sleep(
+            RETRY_CHECK_SECONDS
+        )
+
+
+# =========================
+# 정각 스케줄러
 # =========================
 def seconds_until_next_slot():
     now = datetime.now(TIMEZONE)
@@ -723,7 +798,7 @@ async def scheduler():
             f"[자동발송 완료] "
             f"성공={success} "
             f"실패={failed} "
-            f"슬로우재시도={retry}"
+            f"대기방={retry}"
         )
 
 
@@ -774,16 +849,7 @@ async def handle_command(event):
         "/상태",
         "/재시도현황"
     ):
-        active_ids = [
-            chat_id
-            for chat_id, task
-            in RETRY_TASKS.items()
-            if not task.done()
-        ]
-
-        flood_remaining = (
-            get_global_flood_remaining()
-        )
+        retry_rows = get_retry_list(30)
 
         lines = [
             "📊 유저봇 상태",
@@ -796,32 +862,32 @@ async def handle_command(event):
                 )
             ),
             (
-                "계정 FloodWait 남은 시간: "
-                f"{flood_remaining}초"
-            ),
-            (
-                "슬로우모드 재시도 방: "
-                f"{len(active_ids)}개"
-            ),
-            (
                 "방별 발송 간격: "
                 f"{SEND_DELAY_SECONDS}초"
+            ),
+            (
+                "재시도 확인 주기: "
+                f"{RETRY_CHECK_SECONDS}초"
+            ),
+            (
+                "격리/재시도 대기 방: "
+                f"{get_retry_count()}개"
             ),
             "발송 방식: 채널 게시글 전달(Forward)",
         ]
 
-        if active_ids:
+        for row in retry_rows:
+            retry_at = row["retry_at"].astimezone(TIMEZONE)
+
             lines.append(
-                "\n재시도 대기 ID\n"
-                + "\n".join(
-                    str(x)
-                    for x in active_ids[:30]
-                )
+                f"\n⏳ {row['room_title'] or row['chat_id']}\n"
+                f"{row['reason']} / "
+                f"{retry_at.strftime('%m/%d %H:%M:%S')}"
             )
 
         await respond(
             event,
-            "\n".join(lines)
+            "\n".join(lines)[:4000]
         )
         return
 
@@ -913,14 +979,6 @@ async def handle_command(event):
             )
 
             remove_room(chat_id)
-
-            task = RETRY_TASKS.pop(
-                chat_id,
-                None
-            )
-
-            if task and not task.done():
-                task.cancel()
 
             await respond(
                 event,
@@ -1052,7 +1110,7 @@ async def handle_command(event):
             "✅ 전달 발송 완료\n"
             f"성공 {success} / "
             f"실패 {failed} / "
-            f"슬로우재시도 {retry}"
+            f"대기방 {retry}"
         )
         return
 
@@ -1148,7 +1206,6 @@ async def handle_command(event):
         return
 
 
-# 내 계정이 직접 보낸 명령만 처리
 @client.on(
     events.NewMessage(
         outgoing=True
@@ -1201,12 +1258,15 @@ async def main():
         "채널 게시글 전달(Forward)"
     )
     print(
-        "SlowMode/FloodWait "
-        "분리 처리 활성화"
+        "FloodWait/SlowMode "
+        "방별 격리 모드 활성화"
     )
 
     asyncio.create_task(
         scheduler()
+    )
+    asyncio.create_task(
+        retry_worker()
     )
 
     await client.run_until_disconnected()
