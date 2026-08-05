@@ -36,6 +36,10 @@ SEND_DELAY_SECONDS = float(os.environ.get("SEND_DELAY_SECONDS", "30.0"))
 # 재시도 확인 주기
 RETRY_CHECK_SECONDS = int(os.environ.get("RETRY_CHECK_SECONDS", "30"))
 
+# 레이트리밋 설정
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
+BATCH_PAUSE_SECONDS = float(os.environ.get("BATCH_PAUSE_SECONDS", "300"))
+
 TIMEZONE = ZoneInfo("Asia/Seoul")
 
 client = TelegramClient(
@@ -605,9 +609,12 @@ async def send_to_all_rooms(trigger_type="자동"):
     success = 0
     failed = 0
     retry = 0
+    processed_in_batch = 0
 
     async with SEND_BATCH_LOCK:
-        for room in rooms:
+        total_rooms = len(rooms)
+
+        for index, room in enumerate(rooms, 1):
             result = await send_one_room(
                 room,
                 trigger_type
@@ -615,16 +622,39 @@ async def send_to_all_rooms(trigger_type="자동"):
 
             if result == "success":
                 success += 1
+                processed_in_batch += 1
+
+                # 방 하나 성공 후 다음 방까지 기본 간격
                 await asyncio.sleep(
                     SEND_DELAY_SECONDS
                 )
+
             elif result == "retry":
                 retry += 1
-                # 격리된 방은 바로 다음 방으로 진행
+                # 격리된 방은 바로 넘기되 너무 촘촘하지 않게 짧게 쉼
                 await asyncio.sleep(1)
+
             else:
                 failed += 1
                 await asyncio.sleep(1)
+
+            # 성공 발송 BATCH_SIZE개마다 긴 휴식
+            if (
+                BATCH_SIZE > 0
+                and processed_in_batch >= BATCH_SIZE
+                and index < total_rooms
+            ):
+                print(
+                    f"[레이트리밋 휴식] "
+                    f"{processed_in_batch}개 성공 발송 완료 - "
+                    f"{BATCH_PAUSE_SECONDS}초 대기"
+                )
+
+                await asyncio.sleep(
+                    BATCH_PAUSE_SECONDS
+                )
+
+                processed_in_batch = 0
 
     return success, failed, retry
 
@@ -746,59 +776,39 @@ async def retry_worker():
 # =========================
 # 정각 스케줄러
 # =========================
-def seconds_until_next_slot():
-    now = datetime.now(TIMEZONE)
-
-    next_run = (
-        now.replace(
-            minute=0,
-            second=0,
-            microsecond=0
-        )
-        + timedelta(hours=1)
-    )
-
-    if INTERVAL_HOURS > 1:
-        while (
-            next_run.hour
-            % INTERVAL_HOURS
-            != 0
-        ):
-            next_run += timedelta(hours=1)
-
-    return (
-        max(
-            1,
-            (next_run - now).total_seconds()
-        ),
-        next_run
-    )
-
-
 async def scheduler():
+    """
+    정각 고정이 아니라 '이전 전체 발송이 끝난 시점'을 기준으로
+    INTERVAL_HOURS 만큼 기다린 뒤 다음 발송을 시작한다.
+
+    예:
+    03:10 시작 → 03:40 완료 → 1시간 대기 → 04:40 다음 시작
+    발송이 늦어지면 다음 시작 시간도 자연스럽게 뒤로 밀린다.
+    """
     while True:
-        wait_seconds, next_run = (
-            seconds_until_next_slot()
-        )
+        started_at = datetime.now(TIMEZONE)
 
         print(
-            "다음 자동발송:",
-            next_run.strftime(
-                "%Y-%m-%d %H:%M:%S KST"
-            )
+            "[자동발송 시작] "
+            + started_at.strftime("%Y-%m-%d %H:%M:%S KST")
         )
 
-        await asyncio.sleep(wait_seconds)
+        success, failed, retry = await send_to_all_rooms("자동")
 
-        success, failed, retry = (
-            await send_to_all_rooms("자동")
-        )
+        finished_at = datetime.now(TIMEZONE)
+        next_run = finished_at + timedelta(hours=INTERVAL_HOURS)
 
         print(
             f"[자동발송 완료] "
-            f"성공={success} "
-            f"실패={failed} "
-            f"대기방={retry}"
+            f"성공={success} 실패={failed} 대기방={retry}"
+        )
+        print(
+            "다음 자동발송:",
+            next_run.strftime("%Y-%m-%d %H:%M:%S KST")
+        )
+
+        await asyncio.sleep(
+            INTERVAL_HOURS * 3600
         )
 
 
@@ -868,6 +878,14 @@ async def handle_command(event):
             (
                 "재시도 확인 주기: "
                 f"{RETRY_CHECK_SECONDS}초"
+            ),
+            (
+                "배치 크기: "
+                f"{BATCH_SIZE}개"
+            ),
+            (
+                "배치 휴식: "
+                f"{BATCH_PAUSE_SECONDS}초"
             ),
             (
                 "격리/재시도 대기 방: "
@@ -1242,12 +1260,17 @@ async def main():
         f"{me.first_name} / id={MY_ID}"
     )
     print(
-        f"자동발송 간격="
-        f"{INTERVAL_HOURS}시간"
+        f"자동발송 휴식간격="
+        f"{INTERVAL_HOURS}시간 (이전 발송 완료 후 기준)"
     )
     print(
         f"방별 발송 대기="
         f"{SEND_DELAY_SECONDS}초"
+    )
+    print(
+        f"레이트리밋 배치="
+        f"{BATCH_SIZE}개 / "
+        f"휴식 {BATCH_PAUSE_SECONDS}초"
     )
     print(
         "명령어 감지기 활성화"
